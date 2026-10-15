@@ -183,24 +183,34 @@ class VideoSegmentationWorker(QThread):
                     self._cleanup_file(tmp_seg)
                     raise Exception(f"分割第 {i + 1} 段失败: {cut_err}")
                 final_file = os.path.join(self.output_dir, f"{base_name}_part_{i:03d}{ext}")
-                if tmp_ext.lower() == ext.lower():
-                    os.replace(tmp_seg, final_file)
-                else:
+                remux_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i", tmp_seg,
+                    "-map", "0",
+                    "-c", "copy",
+                    "-muxdelay", "0",
+                    "-muxpreload", "0",
+                    final_file
+                ]
+                code, err = self._run_ffmpeg(remux_cmd)
+                if code != 0:
                     remux_cmd = [
                         "ffmpeg",
                         "-y",
                         "-i", tmp_seg,
                         "-map", "0",
+                        "-map", "-0:d",
                         "-c", "copy",
-                        "-avoid_negative_ts", "make_zero",
                         "-muxdelay", "0",
                         "-muxpreload", "0",
                         final_file
                     ]
                     code, err = self._run_ffmpeg(remux_cmd)
+                if code != 0:
+                    os.replace(tmp_seg, final_file)
+                else:
                     self._cleanup_file(tmp_seg)
-                    if code != 0:
-                        raise Exception(f"封装第 {i + 1} 段失败: {(err or '').strip()[-500:]}")
                 self.progress.emit(min(60 + int((i + 1) / total * 38), 98))
             self.progress.emit(100)
             self.finished.emit("基于语音内容的智能视频分割完成！")
@@ -292,7 +302,7 @@ class VideoSegmentationWorker(QThread):
             return t
         prev = None
         for k in keyframes:
-            if k <= t + 1e-6:
+            if k <= t + 0.5:
                 prev = k
             else:
                 break
@@ -377,14 +387,15 @@ class VideoSegmentationWorker(QThread):
             target_end = current_start + self.segment_duration
             if video_duration - target_end < self.segment_duration * 0.5:
                 break
+            min_point = current_start + self.segment_duration * 0.6
             best_point = None
             for break_point in dialogue_breaks:
-                if current_start < break_point <= target_end + 15:
+                if min_point <= break_point <= target_end + 15:
                     if best_point is None or abs(break_point - target_end) < abs(best_point - target_end):
                         best_point = break_point
             if best_point is None:
                 for point in silence_points:
-                    if current_start < point <= target_end + 10:
+                    if min_point <= point <= target_end + 10:
                         if best_point is None or abs(point - target_end) < abs(best_point - target_end):
                             best_point = point
             if best_point is None:
