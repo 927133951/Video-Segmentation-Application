@@ -122,14 +122,21 @@ class VideoSegmentationWorker(QThread):
 
     def _segment_based_on_speech(self):
         temp_audio = None
+        work_source = self.video_path
         try:
             self.progress.emit(5)
+            work_source = self._prepare_normalized_source()
+            if work_source != self.video_path:
+                duration = self._get_video_duration(work_source)
+                if duration > 0:
+                    self.video_duration = duration
+            self.progress.emit(8)
             fd, temp_audio = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
             extract_cmd = [
                 "ffmpeg",
                 "-y",
-                "-i", self.video_path,
+                "-i", work_source,
                 "-vn",
                 "-acodec", "pcm_s16le",
                 "-ar", "16000",
@@ -153,29 +160,51 @@ class VideoSegmentationWorker(QThread):
             video_duration = self._resolve_duration()
             boundaries = [0.0]
             for point in cut_points:
-                keyframe = self._snap_to_keyframe(point)
+                keyframe = self._snap_to_keyframe(point, work_source)
                 if boundaries[-1] + 1.0 < keyframe < video_duration - 0.5:
                     boundaries.append(keyframe)
             boundaries.append(video_duration)
             base_name, ext = os.path.splitext(os.path.basename(self.video_path))
+            tmp_ext = os.path.splitext(work_source)[1] or ".mp4"
             total = len(boundaries) - 1
             for i in range(total):
                 if self._cancelled:
                     self.finished.emit("分割已取消")
                     return
-                output_file = os.path.join(self.output_dir, f"{base_name}_part_{i:03d}{ext}")
+                tmp_seg = os.path.join(self.output_dir, f"__segtmp_{os.getpid()}_{i}{tmp_ext}")
                 segment_cmd = self._build_segment_command(
-                    self.video_path,
-                    output_file,
+                    work_source,
+                    tmp_seg,
                     boundaries[i],
                     boundaries[i + 1]
                 )
                 code, err = self._run_ffmpeg(segment_cmd)
                 if self._cancelled:
+                    self._cleanup_file(tmp_seg)
                     self.finished.emit("分割已取消")
                     return
                 if code != 0:
+                    self._cleanup_file(tmp_seg)
                     raise Exception(f"分割第 {i + 1} 段失败: {(err or '').strip()[-500:]}")
+                final_file = os.path.join(self.output_dir, f"{base_name}_part_{i:03d}{ext}")
+                if tmp_ext.lower() == ext.lower():
+                    os.replace(tmp_seg, final_file)
+                else:
+                    remux_cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i", tmp_seg,
+                        "-map", "0",
+                        "-c", "copy",
+                        "-avoid_negative_ts", "make_zero",
+                        "-muxdelay", "0",
+                        "-muxpreload", "0",
+                        final_file
+                    ]
+                    code, err = self._run_ffmpeg(remux_cmd)
+                    self._cleanup_file(tmp_seg)
+                    if code != 0:
+                        raise Exception(f"封装第 {i + 1} 段失败: {(err or '').strip()[-500:]}")
                 self.progress.emit(min(60 + int((i + 1) / total * 38), 98))
             self.progress.emit(100)
             self.finished.emit("基于语音内容的智能视频分割完成！")
@@ -185,11 +214,43 @@ class VideoSegmentationWorker(QThread):
             else:
                 self.error.emit(f"基于语音内容分割失败: {str(e)}")
         finally:
-            if temp_audio and os.path.exists(temp_audio):
-                try:
-                    os.remove(temp_audio)
-                except OSError:
-                    pass
+            self._cleanup_file(temp_audio)
+            if work_source != self.video_path:
+                self._cleanup_file(work_source)
+            if os.path.isdir(self.output_dir):
+                for leftover in os.listdir(self.output_dir):
+                    if leftover.startswith(f"__segtmp_{os.getpid()}_"):
+                        self._cleanup_file(os.path.join(self.output_dir, leftover))
+
+    def _cleanup_file(self, path):
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _prepare_normalized_source(self):
+        ext = os.path.splitext(self.video_path)[1].lower().lstrip(".")
+        if ext in ("mp4", "mov", "m4v"):
+            return self.video_path
+        fd, tmp = tempfile.mkstemp(suffix=".mkv")
+        os.close(fd)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", self.video_path,
+            "-map", "0",
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            tmp
+        ]
+        code, err = self._run_ffmpeg(cmd)
+        if code != 0:
+            self._cleanup_file(tmp)
+            return self.video_path
+        return tmp
 
     def _build_segment_command(self, input_file, output_file, start, end):
         return [
@@ -204,13 +265,15 @@ class VideoSegmentationWorker(QThread):
             output_file
         ]
 
-    def _snap_to_keyframe(self, t):
+    def _snap_to_keyframe(self, t, source=None):
+        if source is None:
+            source = self.video_path
         if t <= 0:
             return 0.0
         try:
-            times = self._probe_keyframes(max(0.0, t - 30), t)
+            times = self._probe_keyframes(max(0.0, t - 30), t, source)
             if not times:
-                times = self._probe_keyframes(t, t + 30)
+                times = self._probe_keyframes(t, t + 30, source)
                 if times:
                     return times[0]
             if times:
@@ -219,7 +282,7 @@ class VideoSegmentationWorker(QThread):
             pass
         return t
 
-    def _probe_keyframes(self, start, end):
+    def _probe_keyframes(self, start, end, source):
         cmd = [
             "ffprobe",
             "-v", "error",
@@ -228,13 +291,13 @@ class VideoSegmentationWorker(QThread):
             "-show_entries", "frame=pts_time",
             "-of", "csv=p=0",
             "-read_intervals", f"{start}%{end}",
-            self.video_path
+            source
         ]
         result = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='ignore')
         times = []
         for line in result.stdout.splitlines():
             try:
-                times.append(float(line.strip()))
+                times.append(float(line.strip().rstrip(',')))
             except ValueError:
                 pass
         return times
@@ -323,13 +386,15 @@ class VideoSegmentationWorker(QThread):
             return self.video_duration
         return self._get_video_duration()
 
-    def _get_video_duration(self):
+    def _get_video_duration(self, source=None):
+        if source is None:
+            source = self.video_path
         cmd = [
             "ffprobe",
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
-            self.video_path
+            source
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='ignore')
         try:
