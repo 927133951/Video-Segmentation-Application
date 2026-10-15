@@ -150,12 +150,13 @@ class VideoSegmentationWorker(QThread):
                 return
             cut_points = self._determine_smart_segment_points(silence_points)
             self.progress.emit(60)
+            video_duration = self._resolve_duration()
             boundaries = [0.0]
             for point in cut_points:
                 keyframe = self._snap_to_keyframe(point)
-                if keyframe > boundaries[-1] + 1.0:
+                if boundaries[-1] + 1.0 < keyframe < video_duration - 0.5:
                     boundaries.append(keyframe)
-            boundaries.append(self._resolve_duration())
+            boundaries.append(video_duration)
             base_name, ext = os.path.splitext(os.path.basename(self.video_path))
             total = len(boundaries) - 1
             for i in range(total):
@@ -207,29 +208,36 @@ class VideoSegmentationWorker(QThread):
         if t <= 0:
             return 0.0
         try:
-            window = max(0.0, t - 30)
-            cmd = [
-                "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-skip_frame", "nokey",
-                "-show_entries", "frame=pts_time",
-                "-of", "csv=p=0",
-                "-read_intervals", f"{window}%{t}",
-                self.video_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='ignore')
-            times = []
-            for line in result.stdout.splitlines():
-                try:
-                    times.append(float(line.strip()))
-                except ValueError:
-                    pass
+            times = self._probe_keyframes(max(0.0, t - 30), t)
+            if not times:
+                times = self._probe_keyframes(t, t + 30)
+                if times:
+                    return times[0]
             if times:
                 return times[-1]
         except OSError:
             pass
         return t
+
+    def _probe_keyframes(self, start, end):
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-skip_frame", "nokey",
+            "-show_entries", "frame=pts_time",
+            "-of", "csv=p=0",
+            "-read_intervals", f"{start}%{end}",
+            self.video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='ignore')
+        times = []
+        for line in result.stdout.splitlines():
+            try:
+                times.append(float(line.strip()))
+            except ValueError:
+                pass
+        return times
 
     def _detect_silence_improved(self, audio_file):
         silence_sets = []
@@ -278,7 +286,7 @@ class VideoSegmentationWorker(QThread):
                 dialogue_breaks.append(point)
         while current_start < video_duration:
             target_end = current_start + self.segment_duration
-            if target_end >= video_duration:
+            if video_duration - target_end < self.segment_duration * 0.5:
                 break
             best_point = None
             for break_point in dialogue_breaks:
@@ -303,8 +311,9 @@ class VideoSegmentationWorker(QThread):
                     if mid_point <= point < best_point:
                         best_point = point
                         break
+            best_point = min(best_point, video_duration - 1.0)
             if best_point <= current_start:
-                best_point = target_end
+                break
             cut_points.append(best_point)
             current_start = best_point
         return cut_points
